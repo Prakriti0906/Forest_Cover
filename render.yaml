@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: forest-cover-app
+    env: python
+    buildCommand: |
+      apt-get update && apt-get install -y gdal-bin libgdal-dev
+      pip install -r requirements.txt
+    startCommand: streamlit run App.py
