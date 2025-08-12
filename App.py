@@ -15,8 +15,6 @@ st.set_page_config(
 )
 
 # --- Model Caching ---
-# @st.cache_resource decorator caches the model so it only loads once per session.
-# This is crucial for performance and preventing repeated OOM errors on the model itself.
 @st.cache_resource
 def load_my_model(model_path):
     """Loads the Keras model from the specified path."""
@@ -40,8 +38,8 @@ def analyze_forest_cover_enhanced(image_bytes, model, patch_size, threshold, pro
             full_prediction_map = np.zeros((src.height, src.width), dtype=np.uint8)
 
             # Define a custom chunk size (in pixels) for memory efficiency.
-            # This is the most important parameter to adjust for OOM errors.
-            CHUNK_SIZE = 1024 
+            # Reduced for better memory management.
+            CHUNK_SIZE = 256 
             
             num_chunks_y = (src.height + CHUNK_SIZE - 1) // CHUNK_SIZE
             num_chunks_x = (src.width + CHUNK_SIZE - 1) // CHUNK_SIZE
@@ -52,7 +50,7 @@ def analyze_forest_cover_enhanced(image_bytes, model, patch_size, threshold, pro
             forest_pixels_count = 0
 
             # Define patch batch size for prediction
-            BATCH_SIZE = 256
+            BATCH_SIZE = 128
             
             for i in range(num_chunks_y):
                 for j in range(num_chunks_x):
@@ -134,7 +132,6 @@ st.markdown("Upload a correctly projected GeoTIFF file to begin.")
 uploaded_file = st.file_uploader("Choose a GeoTIFF (.tif) file...", type=["tif", "tiff"])
 
 if uploaded_file:
-    # Sidebar for parameters
     with st.sidebar:
         st.title("🌳 Forest Cover AI")
         st.markdown("---")
@@ -154,8 +151,6 @@ if uploaded_file:
         summary_display.info("Adjust parameters in the sidebar and click 'Run Analysis'.")
 
     if st.button("Run Analysis", type="primary"):
-        # Load the model from the same directory as the script.
-        # Make sure 'forest_cover_cnn_model.keras' is in the same folder.
         model = load_my_model('forest_cover_cnn_model.keras')
         
         if model:
@@ -165,7 +160,6 @@ if uploaded_file:
             progress_bar = progress_container.progress(0)
             status_text = st.empty()
 
-            # Call the new, enhanced analysis function
             forest_pixels, total_valid_pixels, meta = analyze_forest_cover_enhanced(
                 image_bytes, model, PATCH_SIZE, confidence_threshold, progress_bar, status_text
             )
@@ -174,7 +168,6 @@ if uploaded_file:
             status_text.success("Analysis Complete!")
 
             if forest_pixels is not None:
-                # Calculations
                 pixel_width = meta['transform'][0]
                 pixel_height = abs(meta['transform'][4])
                 area_per_pixel_m2 = pixel_width * pixel_height
@@ -208,3 +201,4 @@ if uploaded_file:
                     st.write(f"**Coordinate Reference System (CRS):** `{meta['crs']}`")
                     st.write(f"**Is Geographic (units in degrees):** `{meta['crs'].is_geographic}`")
                     st.write(f"**Pixel Resolution:** `{pixel_width:.2f}m x {pixel_height:.2f}m`")
+
