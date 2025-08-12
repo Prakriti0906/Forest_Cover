@@ -1,0 +1,10 @@
+[theme]
+base="dark"
+primaryColor="#33FF99" # A vibrant mint/green color
+backgroundColor="#0E1117"
+secondaryBackgroundColor="#262730"
+textColor="#FAFAFA"
+font="sans serif"
+
+[server]
+maxUploadSize = 1024
