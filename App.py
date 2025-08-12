@@ -15,6 +15,8 @@ st.set_page_config(
 )
 
 # --- Model Caching ---
+# @st.cache_resource decorator caches the model so it only loads once per session.
+# This is crucial for performance and preventing repeated OOM errors on the model itself.
 @st.cache_resource
 def load_my_model(model_path):
     """Loads the Keras model from the specified path."""
@@ -26,75 +28,99 @@ def load_my_model(model_path):
         return None
 
 # --- Main Analysis Function ---
-def analyze_forest_cover(image_bytes, model, patch_size, threshold, progress_bar, status_text):
+def analyze_forest_cover_enhanced(image_bytes, model, patch_size, threshold, progress_bar, status_text):
     """
-    Processes a satellite image to calculate forest cover in memory-efficient batches.
-    This version includes nested batching to prevent memory issues with large blocks.
+    Processes a satellite image to calculate forest cover using a custom,
+    memory-efficient chunking method.
     """
     try:
         with rasterio.open(image_bytes) as src:
             meta = src.meta
             nodata_value = src.nodata if src.nodata is not None else 0
+            full_prediction_map = np.zeros((src.height, src.width), dtype=np.uint8)
+
+            # Define a custom chunk size (in pixels) for memory efficiency.
+            # This is the most important parameter to adjust for OOM errors.
+            CHUNK_SIZE = 1024 
+            
+            num_chunks_y = (src.height + CHUNK_SIZE - 1) // CHUNK_SIZE
+            num_chunks_x = (src.width + CHUNK_SIZE - 1) // CHUNK_SIZE
+            total_chunks = num_chunks_y * num_chunks_x
+            current_chunk_idx = 0
+            
+            total_valid_pixels = 0
+            forest_pixels_count = 0
+
+            # Define patch batch size for prediction
+            BATCH_SIZE = 256
+            
+            for i in range(num_chunks_y):
+                for j in range(num_chunks_x):
+                    current_chunk_idx += 1
+                    progress_bar.progress(current_chunk_idx / total_chunks)
+                    status_text.text(f"Processing chunk {current_chunk_idx}/{total_chunks}...")
+
+                    # Calculate the window for the current chunk
+                    row_start = i * CHUNK_SIZE
+                    row_end = min((i + 1) * CHUNK_SIZE, src.height)
+                    col_start = j * CHUNK_SIZE
+                    col_end = min((j + 1) * CHUNK_SIZE, src.width)
+                    window = rasterio.windows.Window(col_start, row_start, col_end - col_start, row_end - row_start)
+
+                    # Read a small chunk of data with padding for edge patches
+                    pad_width = patch_size // 2
+                    padded_window = window.get_buffered_window(pad_width)
+                    
+                    # Ensure padded window doesn't go outside the image bounds
+                    padded_window = padded_window.intersection(rasterio.windows.Window(0, 0, src.width, src.height))
+                    
+                    padded_chunk_data = src.read(window=padded_window)
+                    padded_chunk_data_preprocessed = np.clip(padded_chunk_data, 0, 4000) / 4000.0
+                    padded_chunk_data_preprocessed = padded_chunk_data_preprocessed.astype(np.float32)
+                    padded_chunk_data_preprocessed = np.moveaxis(padded_chunk_data_preprocessed, 0, -1)
+
+                    chunk_h, chunk_w = window.height, window.width
+                    
+                    # Create patches for the current chunk and make predictions
+                    patches = []
+                    y_indices, x_indices = [], []
+                    
+                    # Calculate the start of the non-padded region within the padded chunk
+                    start_y = window.row_off - padded_window.row_off
+                    start_x = window.col_off - padded_window.col_off
+
+                    for y in range(chunk_h):
+                        for x in range(chunk_w):
+                            y_pad = y + start_y
+                            x_pad = x + start_x
+                            
+                            patch = padded_chunk_data_preprocessed[y_pad:y_pad + patch_size, 
+                                                                   x_pad:x_pad + patch_size, :]
+                            patches.append(patch)
+                            y_indices.append(y)
+                            x_indices.append(x)
+                            
+                            # Process patches in batches
+                            if len(patches) == BATCH_SIZE or (y == chunk_h - 1 and x == chunk_w - 1):
+                                if not patches: continue
+
+                                patches_np = np.array(patches)
+                                predictions = model.predict(patches_np, verbose=0)
+                                class_labels = (predictions > threshold).astype(np.uint8)
+                                
+                                # Assign predictions to the correct position in the final map
+                                for k, (y_pos, x_pos) in enumerate(zip(y_indices, x_indices)):
+                                    full_prediction_map[row_start + y_pos, col_start + x_pos] = class_labels[k]
+
+                                patches = []
+                                y_indices, x_indices = [], []
+
+            # Final calculations after processing the entire image
             first_band = src.read(1)
             valid_data_mask = (first_band != nodata_value).astype(np.uint8)
             total_valid_pixels = np.sum(valid_data_mask)
-
-            full_prediction_map = np.zeros((src.height, src.width), dtype=np.uint8)
-            num_blocks = len(list(src.block_windows(1)))
-            current_block = 0
-            
-            # Define a smaller batch size for processing patches
-            BATCH_SIZE = 256 # You can adjust this value based on your available memory
-
-            for ji, window in src.block_windows(1):
-                current_block += 1
-                progress_bar.progress(current_block / num_blocks)
-                status_text.text(f"Processing block {current_block}/{num_blocks}...")
-
-                block_data = src.read(window=window)
-                block_data_preprocessed = np.clip(block_data, 0, 4000) / 4000.0
-                block_data_preprocessed = block_data_preprocessed.astype(np.float32)
-                block_data_preprocessed = np.moveaxis(block_data_preprocessed, 0, -1)
-                
-                pad_width = patch_size // 2
-                padded_block = np.pad(block_data_preprocessed, 
-                                      [(pad_width, pad_width), (pad_width, pad_width), (0, 0)], 
-                                      mode='reflect')
-                
-                block_h, block_w, _ = block_data_preprocessed.shape
-                block_predictions = np.zeros((block_h, block_w), dtype=np.uint8)
-
-                patches = []
-                patch_positions = []
-                for y in range(block_h):
-                    for x in range(block_w):
-                        patches.append(padded_block[y: y + patch_size, x: x + patch_size, :])
-                        patch_positions.append((y, x))
-                        
-                        # Process patches in batches instead of all at once
-                        if len(patches) == BATCH_SIZE:
-                            patches_np = np.array(patches)
-                            predictions = model.predict(patches_np, verbose=0)
-                            class_labels = (predictions > threshold).astype(np.uint8)
-
-                            for (y_pos, x_pos), label in zip(patch_positions, class_labels):
-                                block_predictions[y_pos, x_pos] = label
-
-                            patches = [] # Clear patches list for the next batch
-                            patch_positions = [] # Clear positions list
-                
-                # Process any remaining patches in the last batch
-                if patches:
-                    patches_np = np.array(patches)
-                    predictions = model.predict(patches_np, verbose=0)
-                    class_labels = (predictions > threshold).astype(np.uint8)
-                    for (y_pos, x_pos), label in zip(patch_positions, class_labels):
-                        block_predictions[y_pos, x_pos] = label
-
-                full_prediction_map[window.row_off:window.row_off + window.height, 
-                                    window.col_off:window.col_off + window.width] = block_predictions
-            
             final_forest_pixels = np.sum(full_prediction_map * valid_data_mask)
+            
             return final_forest_pixels, total_valid_pixels, meta
 
     except Exception as e:
@@ -102,24 +128,24 @@ def analyze_forest_cover(image_bytes, model, patch_size, threshold, progress_bar
         return None, None, None
 
 # --- Streamlit UI ---
-with st.sidebar:
-    st.title("🌳 Forest Cover AI")
-    st.markdown("---")
-    st.info("An interactive dashboard to analyze forest cover from GeoTIFF satellite images using a CNN.")
-    st.header("Analysis Parameters")
-    PATCH_SIZE = st.number_input("Model Patch Size", min_value=16, max_value=256, value=32, step=16)
-    
-    confidence_threshold = st.slider("Confidence Threshold", min_value=0.0, max_value=1.0, value=0.75, step=0.05,
-                                     help="Set the confidence level to classify a pixel as 'forest'. Higher values are stricter.")
-    st.markdown("---")
-
-
-# --- Main Page ---
 st.title("Interactive Forest Cover Analysis Dashboard")
 st.markdown("Upload a correctly projected GeoTIFF file to begin.")
+
 uploaded_file = st.file_uploader("Choose a GeoTIFF (.tif) file...", type=["tif", "tiff"])
 
-if uploaded_file is not None:
+if uploaded_file:
+    # Sidebar for parameters
+    with st.sidebar:
+        st.title("🌳 Forest Cover AI")
+        st.markdown("---")
+        st.info("An interactive dashboard to analyze forest cover from GeoTIFF satellite images using a CNN.")
+        st.header("Analysis Parameters")
+        PATCH_SIZE = st.number_input("Model Patch Size", min_value=16, max_value=256, value=32, step=16)
+        
+        confidence_threshold = st.slider("Confidence Threshold", min_value=0.0, max_value=1.0, value=0.75, step=0.05,
+                                         help="Set the confidence level to classify a pixel as 'forest'. Higher values are stricter.")
+        st.markdown("---")
+
     tab1, tab2 = st.tabs(["📊 Results Dashboard", "⚙️ Calculation Details"])
 
     with tab1:
@@ -128,7 +154,10 @@ if uploaded_file is not None:
         summary_display.info("Adjust parameters in the sidebar and click 'Run Analysis'.")
 
     if st.button("Run Analysis", type="primary"):
+        # Load the model from the same directory as the script.
+        # Make sure 'forest_cover_cnn_model.keras' is in the same folder.
         model = load_my_model('forest_cover_cnn_model.keras')
+        
         if model:
             image_bytes = io.BytesIO(uploaded_file.getvalue())
             
@@ -136,7 +165,8 @@ if uploaded_file is not None:
             progress_bar = progress_container.progress(0)
             status_text = st.empty()
 
-            forest_pixels, total_valid_pixels, meta = analyze_forest_cover(
+            # Call the new, enhanced analysis function
+            forest_pixels, total_valid_pixels, meta = analyze_forest_cover_enhanced(
                 image_bytes, model, PATCH_SIZE, confidence_threshold, progress_bar, status_text
             )
             
